@@ -1,9 +1,22 @@
 #!/usr/bin/env python3
-
 """
-F.O.R.G.E. - Demo 3 (System Intelligence & Voice Integration)
-Integrates YOLO tool detection, laser pan/tilt, drawer sensing, 
-offline voice commands with a wake word (Vosk), and TTS (espeak).
+demo3_forge_inventory_voice.py
+
+F.O.R.G.E. Demo 3
+- YOLO tool detection + pan/tilt + laser
+- 7x7 manual grid calibration
+- Piecewise bilinear interpolation
+- EMA smoothing
+- Deadband + rate limiting
+- PWM cut to reduce jitter
+- Fullscreen UI
+- Drawer/cabinet reed switch context
+- Inventory states:
+    * ON_BENCH
+    * MISPLACED
+    * OFF_BENCH
+- Offline voice commands with Vosk
+- Mic captured at 48 kHz, downsampled to 16 kHz for Vosk
 """
 
 from ultralytics import YOLO
@@ -13,149 +26,210 @@ import cv2
 import time
 import json
 import math
-import RPi.GPIO as GPIO
-import threading
 import queue
-import subprocess
+import threading
+import numpy as np
 import sounddevice as sd
-from vosk import Model, KaldiRecognizer
+from vosk import Model as VoskModel, KaldiRecognizer
+import RPi.GPIO as GPIO
 
 # ----------------------------
 # MODEL / CAMERA SETTINGS
 # ----------------------------
-MODEL_PATH   = "/home/smartworkbench/best_n.pt"
-CALIB_JSON   = "laser_grid_7x7_runtime_view.json"
-VOSK_MODEL_PATH = "model" # Path to extracted vosk-model-small-en-us
-FRAME_SIZE   = (480, 360)       
-INFER_SIZE   = 320
-CONF_THRESH_GLOBAL = 0.70
+MODEL_PATH = "/home/smartworkbench/best_n.pt"
+CALIB_JSON = "/home/smartworkbench/laser_grid_7x7_runtime_view.json"
+FRAME_SIZE = (480, 360)
+INFER_SIZE = 320
 
+CONF_THRESH_GLOBAL = 0.70
 CONF_THRESH_BY_NAME = {
     "tape_measure": 0.60,
 }
 
 # ----------------------------
+# VOICE SETTINGS
+# ----------------------------
+VOICE_ENABLED = True
+VOSK_MODEL_PATH = "/home/smartworkbench/vosk-model-small-en-us-0.15"
+VOICE_DEVICE = 1
+
+# Capture at mic-supported rate, then downsample for Vosk
+VOICE_INPUT_RATE = 48000
+VOICE_TARGET_RATE = 16000
+VOICE_BLOCKSIZE = 4800   # 0.1 sec at 48k
+
+VOICE_GRAMMAR = json.dumps([
+    "forge",
+    "forage",
+
+    "forge wrench",
+    "forge pliers",
+    "forge screwdriver",
+    "forge hammer",
+    "forge tape measure",
+    "forge handsaw",
+    "forge allen keys",
+    "forge allen key",
+    "forge hex key",
+
+    "forge find wrench",
+    "forge find pliers",
+    "forge find screwdriver",
+    "forge find hammer",
+    "forge find tape measure",
+    "forge find handsaw",
+    "forge find allen keys",
+    "forge find allen key",
+    "forge find hex key",
+
+    "forge lock wrench",
+    "forge lock pliers",
+    "forge lock screwdriver",
+    "forge lock hammer",
+    "forge lock tape measure",
+    "forge lock handsaw",
+    "forge lock allen keys",
+    "forge lock allen key",
+    "forge lock hex key",
+
+    "forge auto",
+    "forge auto mode",
+    "forge unlock",
+    "forge status",
+    "forge what do you see",
+    "forge visible tools",
+    "forge quit",
+
+    "forage wrench",
+    "forage pliers",
+    "forage screwdriver",
+    "forage hammer",
+    "forage tape measure",
+    "forage handsaw",
+    "forage allen keys",
+    "forage allen key",
+    "forage hex key",
+
+    "forage find wrench",
+    "forage find pliers",
+    "forage find screwdriver",
+    "forage find hammer",
+    "forage find tape measure",
+    "forage find handsaw",
+    "forage find allen keys",
+    "forage find allen key",
+    "forage find hex key",
+
+    "forage lock wrench",
+    "forage lock pliers",
+    "forage lock screwdriver",
+    "forage lock hammer",
+    "forage lock tape measure",
+    "forage lock handsaw",
+    "forage lock allen keys",
+    "forage lock allen key",
+    "forage lock hex key",
+
+    "forage auto",
+    "forage auto mode",
+    "forage unlock",
+    "forage status",
+    "forage what do you see",
+    "forage visible tools",
+    "forage quit"
+])
+
+# ----------------------------
 # GPIO PINS
 # ----------------------------
 GPIO.setmode(GPIO.BCM)
-PIN_TILT  = 23
-PIN_PAN   = 24
+
+PIN_TILT = 23
+PIN_PAN = 24
 PIN_LASER = 17
-PIN_DRAWER  = 5
+
+PIN_DRAWER = 5
 PIN_CABINET = 6
+
 REED_DEBOUNCE_S = 0.05
 DRAWER_LOW_MEANS_CLOSED = True
 CABINET_LOW_MEANS_CLOSED = True
 
 # ----------------------------
-# SERVO SETTINGS (SG90)
+# SERVO SETTINGS
 # ----------------------------
 SERVO_HZ = 50
-SERVO_UPDATE_PERIOD = 0.10   
-DEADBAND_DEG        = 1.0
-PULSE_HOLD_TIME     = 0.08
-PAN_MIN, PAN_MAX     = 0.0, 180.0
-TILT_MIN, TILT_MAX   = 0.0, 180.0
+SERVO_UPDATE_PERIOD = 0.10
+DEADBAND_DEG = 1.0
+PULSE_HOLD_TIME = 0.08
+PAN_MIN, PAN_MAX = 0.0, 180.0
+TILT_MIN, TILT_MAX = 0.0, 180.0
 
 # ----------------------------
-# TIMEOUTS & STATE MACHINE
+# SMOOTHING / TIMEOUT
 # ----------------------------
-EMA_ALPHA         = 0.25
-NO_DET_TIMEOUT    = 0.6
+EMA_ALPHA = 0.25
+NO_DET_TIMEOUT = 0.6
 LOCK_LOST_TIMEOUT = 0.35
-PRESENCE_HOLD_S   = 0.45
+PRESENCE_HOLD_S = 0.45
 
-PAN_OFFSET_DEG  = 0.0
-TILT_OFFSET_DEG = 0.0
+AUTO_SWITCH_HOLD_S = 0.35
+AUTO_SWITCH_MARGIN = 0.08
+AUTO_TARGET_GRACE_S = 0.25
 
 # ----------------------------
-# FIXED TOOL LIST & ALIASES
+# INVENTORY / MISPLACED LOGIC
 # ----------------------------
-FIXED_TOOL_ORDER = [
-    "wrench", "pliers", "screwdriver", "hammer", 
-    "tape_measure", "handsaw", "allen_keys"
-]
+INVENTORY_HOLD_S = 0.80
+MISPLACED_TOASTS = True
+ZONE_SPLITS = (0.33, 0.66)
 
-SEARCH_ALIASES = {
-    "allen": "allen_keys", "allen key": "allen_keys", "hex key": "allen_keys",
-    "tape": "tape_measure", "tape measure": "tape_measure",
-    "screw": "screwdriver", "driver": "screwdriver",
+TOOL_EXPECTED_ZONE = {
+    "wrench": "right",
+    "pliers": "center",
+    "screwdriver": "left",
+    "hammer": "right",
+    "tape_measure": "center",
+    "handsaw": "left",
+    "allen_keys": "center",
 }
 
 # ----------------------------
-# THREAD QUEUES (VOICE & TTS)
+# OPTIONAL GLOBAL TRIM
 # ----------------------------
-voice_cmd_queue = queue.Queue()
-tts_queue = queue.Queue()
-
-def tts_loop(q):
-    """Background thread to handle text-to-speech without blocking the camera loop."""
-    while True:
-        text = q.get()
-        if text is None: break
-        subprocess.run(["espeak", "-ven+m3", "-s150", text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        q.task_done()
-
-def voice_assistant_loop(cmd_queue, tts_q):
-    """Background thread running Vosk for offline wake-word and command processing."""
-    try:
-        model = Model(VOSK_MODEL_PATH)
-        rec = KaldiRecognizer(model, 16000)
-        
-        awake = False
-        awake_timeout = 0.0
-        wake_words = ["hey forge", "hey ford", "hey george", "hey board"]
-        
-        with sd.RawInputStream(samplerate=16000, blocksize=8000, dtype='int16',
-                               channels=1, callback=lambda *args: None) as stream:
-            print("[INFO] Voice Assistant Listening for Wake Word...")
-            while True:
-                data = stream.read(4000)[0]
-                if rec.AcceptWaveform(data):
-                    res = json.loads(rec.Result())
-                    text = res.get('text', '')
-                    now = time.time()
-                    
-                    if awake and (now > awake_timeout):
-                        awake = False
-                        print("[INFO] F.O.R.G.E. went back to sleep.")
-                    
-                    if not awake:
-                        if any(ww in text for ww in wake_words):
-                            awake = True
-                            awake_timeout = now + 6.0 
-                            tts_q.put("Ready.") 
-                            print("[INFO] Wake word detected! Listening for command...")
-                        continue 
-                    
-                    if awake:
-                        if "where is the" in text:
-                            for alias, canon in SEARCH_ALIASES.items():
-                                if alias in text:
-                                    cmd_queue.put(("LOCATE", canon))
-                                    awake = False 
-                                    break
-                            for tool in FIXED_TOOL_ORDER:
-                                if tool.replace("_", " ") in text:
-                                    cmd_queue.put(("LOCATE", tool))
-                                    awake = False 
-                                    break
-                                    
-                        elif "missing" in text or "what is missing" in text:
-                            cmd_queue.put(("REPORT", None))
-                            awake = False
-                            
-    except Exception as e:
-        print(f"[WARN] Voice Assistant failed to start: {e}")
-
-# Start background threads
-tts_thread = threading.Thread(target=tts_loop, args=(tts_queue,), daemon=True)
-tts_thread.start()
-voice_thread = threading.Thread(target=voice_assistant_loop, args=(voice_cmd_queue, tts_queue), daemon=True)
-voice_thread.start()
+PAN_OFFSET_DEG = 0.0
+TILT_OFFSET_DEG = 0.0
 
 # ----------------------------
-# UTILS & GRID MAPPING
+# FIXED TOOL LIST
+# ----------------------------
+FIXED_TOOL_ORDER = [
+    "wrench",
+    "pliers",
+    "screwdriver",
+    "hammer",
+    "tape_measure",
+    "handsaw",
+    "allen_keys",
+]
+
+SEARCH_ALIASES = {
+    "allen": "allen_keys",
+    "allen key": "allen_keys",
+    "allen keys": "allen_keys",
+    "hex": "allen_keys",
+    "hex key": "allen_keys",
+    "hex keys": "allen_keys",
+    "tape": "tape_measure",
+    "tape measure": "tape_measure",
+    "measure": "tape_measure",
+    "screw": "screwdriver",
+    "driver": "screwdriver",
+    "screw driver": "screwdriver",
+}
+
+# ----------------------------
+# UTILS
 # ----------------------------
 def clamp(v, lo, hi):
     return lo if v < lo else hi if v > hi else v
@@ -171,130 +245,384 @@ def set_servo_angle(pwm, angle):
     pwm.ChangeDutyCycle(0)
 
 def bilinear(u, v, tl, tr, bl, br):
-    return (tl * (1-u) * (1-v) + tr * u * (1-v) +
-            bl * (1-u) * v + br * u * v)
+    return (
+        tl * (1 - u) * (1 - v) +
+        tr * u * (1 - v) +
+        bl * (1 - u) * v +
+        br * u * v
+    )
 
 def normalize_name(s):
-    s = s.strip().lower().replace("-", " ").replace("_", " ")
-    return " ".join(s.split())
+    s = s.strip().lower()
+    s = s.replace("-", " ").replace("_", " ")
+    s = " ".join(s.split())
+    return s
 
+def get_horizontal_zone(u):
+    if u < ZONE_SPLITS[0]:
+        return "left"
+    elif u < ZONE_SPLITS[1]:
+        return "center"
+    return "right"
+
+def classify_inventory_state(tool_name, now, st):
+    if (now - st["last_seen"]) > INVENTORY_HOLD_S:
+        return "OFF_BENCH"
+
+    expected = TOOL_EXPECTED_ZONE.get(tool_name)
+    seen_zone = st.get("zone")
+
+    if expected is None or seen_zone is None:
+        return "ON_BENCH"
+
+    if seen_zone == expected:
+        return "ON_BENCH"
+
+    return "MISPLACED"
+
+def inventory_state_color(state):
+    if state == "ON_BENCH":
+        return (60, 210, 90)
+    if state == "MISPLACED":
+        return (0, 215, 255)
+    return (90, 90, 95)
+
+def inventory_state_text_color(state):
+    if state == "ON_BENCH":
+        return (245, 245, 245)
+    if state == "MISPLACED":
+        return (255, 245, 200)
+    return (130, 130, 130)
+
+def downsample_48k_to_16k(raw_bytes: bytes) -> bytes:
+    """Simple exact decimation: 48k -> 16k."""
+    samples = np.frombuffer(raw_bytes, dtype=np.int16)
+    down = samples[::3]
+    return down.tobytes()
+
+# ----------------------------
+# GRID LOADING + PIECEWISE MAP
+# ----------------------------
 def load_grid(path):
     with open(path, "r") as f:
         d = json.load(f)
+
     u_list = [float(x) for x in d["u_list"]]
     v_list = [float(x) for x in d["v_list"]]
+
     pv = {}
     for p in d["points"]:
-        pv[(float(p["u"]), float(p["v"]))] = (float(p["pan"]), float(p["tilt"]))
+        key = (float(p["u"]), float(p["v"]))
+        pv[key] = (float(p["pan"]), float(p["tilt"]))
+
+    missing = []
+    for v in v_list:
+        for u in u_list:
+            if (u, v) not in pv:
+                missing.append((u, v))
+
+    if missing:
+        raise ValueError(f"Missing calibration points: {missing}")
+
     return u_list, v_list, pv
 
 def find_cell(t, t_list):
-    if t <= t_list[0]: return 0
-    if t >= t_list[-1]: return len(t_list) - 2
+    if t <= t_list[0]:
+        return 0
+    if t >= t_list[-1]:
+        return len(t_list) - 2
     for i in range(len(t_list) - 1):
-        if t_list[i] <= t <= t_list[i+1]:
+        if t_list[i] <= t <= t_list[i + 1]:
             return i
     return len(t_list) - 2
 
 def map_uv_to_pan_tilt(u, v, u_list, v_list, pv):
     u = clamp(u, 0.0, 1.0)
     v = clamp(v, 0.0, 1.0)
-    i, j = find_cell(u, u_list), find_cell(v, v_list)
-    u0, u1 = u_list[i], u_list[i+1]
-    v0, v1 = v_list[j], v_list[j+1]
-    uu = 0.0 if u1 == u0 else clamp((u - u0) / (u1 - u0), 0.0, 1.0)
-    vv = 0.0 if v1 == v0 else clamp((v - v0) / (v1 - v0), 0.0, 1.0)
-    
+
+    i = find_cell(u, u_list)
+    j = find_cell(v, v_list)
+
+    u0, u1 = u_list[i], u_list[i + 1]
+    v0, v1 = v_list[j], v_list[j + 1]
+
+    uu = 0.0 if u1 == u0 else (u - u0) / (u1 - u0)
+    vv = 0.0 if v1 == v0 else (v - v0) / (v1 - v0)
+
+    uu = clamp(uu, 0.0, 1.0)
+    vv = clamp(vv, 0.0, 1.0)
+
     pan_tl, tilt_tl = pv[(u0, v0)]
     pan_tr, tilt_tr = pv[(u1, v0)]
     pan_bl, tilt_bl = pv[(u0, v1)]
     pan_br, tilt_br = pv[(u1, v1)]
-    
-    pan  = clamp(bilinear(uu, vv, pan_tl, pan_tr, pan_bl, pan_br) + PAN_OFFSET_DEG, PAN_MIN, PAN_MAX)
-    tilt = clamp(bilinear(uu, vv, tilt_tl, tilt_tr, tilt_bl, tilt_br) + TILT_OFFSET_DEG, TILT_MIN, TILT_MAX)
+
+    pan = bilinear(uu, vv, pan_tl, pan_tr, pan_bl, pan_br) + PAN_OFFSET_DEG
+    tilt = bilinear(uu, vv, tilt_tl, tilt_tr, tilt_bl, tilt_br) + TILT_OFFSET_DEG
+
+    pan = clamp(pan, PAN_MIN, PAN_MAX)
+    tilt = clamp(tilt, TILT_MIN, TILT_MAX)
+
     return pan, tilt
 
 def map_xy_to_pan_tilt(x, y, frame_w, frame_h, u_list, v_list, pv):
-    return map_uv_to_pan_tilt(x/float(frame_w), y/float(frame_h), u_list, v_list, pv)
+    u = clamp(x / float(frame_w), 0.0, 1.0)
+    v = clamp(y / float(frame_h), 0.0, 1.0)
+    return map_uv_to_pan_tilt(u, v, u_list, v_list, pv)
 
 # ----------------------------
-# UI HELPERS (Inventory States)
+# UI HELPERS
 # ----------------------------
 def blend_rect(img, x1, y1, x2, y2, color_bgr, alpha):
-    x1, x2 = max(0, min(img.shape[1], int(x1))), max(0, min(img.shape[1], int(x2)))
-    y1, y2 = max(0, min(img.shape[0], int(y1))), max(0, min(img.shape[0], int(y2)))
-    if x2 <= x1 or y2 <= y1: return
+    x1 = max(0, min(img.shape[1], int(x1)))
+    x2 = max(0, min(img.shape[1], int(x2)))
+    y1 = max(0, min(img.shape[0], int(y1)))
+    y2 = max(0, min(img.shape[0], int(y2)))
+    if x2 <= x1 or y2 <= y1:
+        return
     overlay = img.copy()
     cv2.rectangle(overlay, (x1, y1), (x2, y2), color_bgr, -1)
     cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
 
-def state_color(state):
-    if state == "ON_BENCH": return (60, 210, 90)   # Green
-    if state == "IN_DRAWER": return (220, 190, 80) # Blue
-    return (60, 60, 220)                           # Red (Missing/Unknown)
+def draw_chip(img, x, y, text, color, scale=0.52):
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+    pad_x = 10
+    pad_y = 7
+    x2 = x + tw + pad_x * 2
+    y2 = y + th + pad_y * 2
+    blend_rect(img, x, y, x2, y2, (24, 24, 28), 0.92)
+    cv2.rectangle(img, (x, y), (x2, y2), color, 1)
+    cv2.putText(
+        img, text, (x + pad_x, y + th + pad_y - 2),
+        cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA
+    )
+    return x2
 
 def draw_crosshair(img, x, y, laser_on):
     h, w = img.shape[:2]
-    x, y = int(clamp(x, 0, w - 1)), int(clamp(y, 0, h - 1))
+    x = int(clamp(x, 0, w - 1))
+    y = int(clamp(y, 0, h - 1))
+
+    size = 42
+    thickness = 2
     color = (0, 235, 255)
-    cv2.line(img, (x - 42, y), (x + 42, y), color, 2, cv2.LINE_AA)
-    cv2.line(img, (x, y - 42), (x, y + 42), color, 2, cv2.LINE_AA)
+
+    cv2.line(img, (x - size, y), (x + size, y), color, thickness, cv2.LINE_AA)
+    cv2.line(img, (x, y - size), (x, y + size), color, thickness, cv2.LINE_AA)
     cv2.circle(img, (x, y), 10, color, 2, cv2.LINE_AA)
+    cv2.circle(img, (x, y), 26, (255, 255, 255), 1, cv2.LINE_AA)
+
     if laser_on:
-        rad = 6 + int(6 * ((math.sin(time.time() * 7.0) + 1.0) / 2.0))
+        t = time.time()
+        pulse = (math.sin(t * 7.0) + 1.0) / 2.0
+        rad = 6 + int(6 * pulse)
         cv2.circle(img, (x, y), rad, (60, 210, 90), -1, cv2.LINE_AA)
 
-def draw_status_bar(img, mode, locked_name, laser_on, current_pan, current_tilt, fps, drawer_open, cabinet_open):
+def draw_status_bar(img, mode, locked_name, laser_on, current_pan, current_tilt, fps,
+                    drawer_open, cabinet_open, tool_state):
     h, w = img.shape[:2]
-    blend_rect(img, 0, 0, w, 64, (18, 18, 20), 0.80)
-    cv2.putText(img, mode, (22, 44), cv2.FONT_HERSHEY_SIMPLEX, 1.05, (0, 235, 255), 2, cv2.LINE_AA)
-    lock_txt = f"LOCK: {locked_name}" if mode == "LOCK" else "LOCK: none"
-    cv2.putText(img, lock_txt, (150, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (235, 235, 235), 1, cv2.LINE_AA)
-    
-    cv2.circle(img, (520, 32), 10, (60, 210, 90) if laser_on else (70, 70, 70), -1 if laser_on else 2, cv2.LINE_AA)
-    cv2.putText(img, "LASER", (538, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (235, 235, 235), 1, cv2.LINE_AA)
-    
-    dx = 880
-    cv2.putText(img, f"DRAWER: {'OPEN' if drawer_open else 'CLOSED'}", (dx, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (60, 210, 90) if drawer_open else (110, 110, 110), 2 if drawer_open else 1, cv2.LINE_AA)
-    cv2.putText(img, f"{fps:.1f} FPS", (w - 120, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (235, 235, 235), 1, cv2.LINE_AA)
+    bar_h = 78
+    blend_rect(img, 0, 0, w, bar_h, (15, 15, 18), 0.88)
+
+    on_bench = sum(1 for nm in FIXED_TOOL_ORDER if tool_state[nm]["state"] == "ON_BENCH")
+    misplaced = sum(1 for nm in FIXED_TOOL_ORDER if tool_state[nm]["state"] == "MISPLACED")
+    off_bench = sum(1 for nm in FIXED_TOOL_ORDER if tool_state[nm]["state"] == "OFF_BENCH")
+
+    cv2.putText(img, "F.O.R.G.E.", (20, 32),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.95, (245, 245, 245), 2, cv2.LINE_AA)
+
+    mode_text = f"MODE: {mode}"
+    cv2.putText(img, mode_text, (20, 62),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 235, 255), 2, cv2.LINE_AA)
+
+    lock_text = f"LOCK: {locked_name}" if mode == "LOCK" and locked_name else "LOCK: none"
+    cv2.putText(img, lock_text, (190, 62),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.62,
+                (235, 235, 235) if mode == "LOCK" else (150, 150, 150), 1, cv2.LINE_AA)
+
+    chip_x = 520
+    chip_x = draw_chip(img, chip_x, 16, f"LASER {'ON' if laser_on else 'OFF'}",
+                       (60, 210, 90) if laser_on else (120, 120, 120))
+    chip_x += 10
+    chip_x = draw_chip(img, chip_x, 16, f"DRAWER {'OPEN' if drawer_open else 'CLOSED'}",
+                       (60, 210, 90) if drawer_open else (140, 140, 140))
+    chip_x += 10
+    chip_x = draw_chip(img, chip_x, 16, f"CAB {'OPEN' if cabinet_open else 'CLOSED'}",
+                       (60, 210, 90) if cabinet_open else (140, 140, 140))
+
+    inv_text = f"ON:{on_bench}  MISPLACED:{misplaced}  OFF:{off_bench}"
+    cv2.putText(img, inv_text, (520, 62),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.60, (220, 220, 220), 1, cv2.LINE_AA)
+
+    pt_text = f"pan={current_pan:.0f} deg  tilt={current_tilt:.0f} deg"
+    cv2.putText(img, pt_text, (w - 360, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.56, (210, 210, 210), 1, cv2.LINE_AA)
+
+    fps_text = f"{fps:.1f} FPS"
+    cv2.putText(img, fps_text, (w - 145, 62),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.62, (235, 235, 235), 1, cv2.LINE_AA)
 
 def draw_tool_panel(img, fixed_tools, selected_idx, locked_name, mode, tool_state):
     h, w = img.shape[:2]
-    panel_w = 420
-    x, y = w - panel_w - 22, 86
-    blend_rect(img, x, y, x + panel_w, min(h - y - 84, 520), (18, 18, 20), 0.74)
-    cv2.putText(img, "Live Inventory", (x + 16, y + 34), cv2.FONT_HERSHEY_SIMPLEX, 0.92, (235, 235, 235), 2, cv2.LINE_AA)
-    
+    panel_w = 430
+    x = w - panel_w - 18
+    y = 94
+    panel_h = min(h - y - 72, 540)
+
+    blend_rect(img, x, y, x + panel_w, y + panel_h, (18, 18, 20), 0.82)
+    cv2.rectangle(img, (x, y), (x + panel_w, y + panel_h), (70, 70, 70), 1)
+
+    cv2.putText(img, "Inventory", (x + 16, y + 32),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.90, (240, 240, 240), 2, cv2.LINE_AA)
+    cv2.putText(img, "TAB=select  ENTER=lock  A=auto  S=search",
+                (x + 16, y + 56),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (170, 170, 170), 1, cv2.LINE_AA)
+
+    row_h = 60
+    base_y = y + 92
+
     for i, name in enumerate(fixed_tools):
-        st = tool_state.get(name, {"state": "UNKNOWN", "conf": 0.0, "present": False})
-        yy = y + 92 + i * 52
-        
+        st = tool_state.get(name, {
+            "present": False,
+            "conf": 0.0,
+            "last_seen": 0.0,
+            "zone": None,
+            "state": "OFF_BENCH",
+        })
+
+        conf = float(st["conf"])
+        state = st.get("state", "OFF_BENCH")
+        zone = st.get("zone", None)
+        expected = TOOL_EXPECTED_ZONE.get(name, "-")
+
+        yy = base_y + i * row_h
+        if yy + 30 > y + panel_h - 10:
+            break
+
         is_sel = (i == selected_idx)
         is_locked = (mode == "LOCK" and locked_name == name)
-        
+
         if is_locked:
-            blend_rect(img, x + 10, yy - 30, x + panel_w - 10, yy + 18, (0, 200, 220), 0.25)
+            blend_rect(img, x + 10, yy - 32, x + panel_w - 10, yy + 24, (0, 200, 220), 0.22)
+            cv2.rectangle(img, (x + 10, yy - 32), (x + panel_w - 10, yy + 24), (0, 235, 255), 2)
         elif is_sel:
-            blend_rect(img, x + 10, yy - 30, x + panel_w - 10, yy + 18, (60, 60, 68), 0.70)
-            
-        col = state_color(st["state"])
-        cv2.putText(img, name, (x + 18, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.78, col, 2 if st["present"] else 1, cv2.LINE_AA)
-        
-        tw, _ = cv2.getTextSize(st["state"], cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)[0]
-        cv2.putText(img, st["state"], (x + panel_w - tw - 16, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 1, cv2.LINE_AA)
+            blend_rect(img, x + 10, yy - 32, x + panel_w - 10, yy + 24, (60, 60, 68), 0.72)
+            cv2.rectangle(img, (x + 10, yy - 32), (x + panel_w - 10, yy + 24), (140, 140, 150), 1)
+        else:
+            blend_rect(img, x + 10, yy - 32, x + panel_w - 10, yy + 24, (33, 33, 37), 0.72)
+
+        name_col = inventory_state_text_color(state)
+        cv2.putText(img, name, (x + 18, yy - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.76, name_col,
+                    2 if state != "OFF_BENCH" else 1, cv2.LINE_AA)
+
+        bar_x1 = x + 18
+        bar_y1 = yy + 10
+        bar_w = 180
+        bar_hh = 8
+        cv2.rectangle(img, (bar_x1, bar_y1), (bar_x1 + bar_w, bar_y1 + bar_hh), (55, 55, 60), -1)
+
+        if state != "OFF_BENCH":
+            fill = int(bar_w * clamp(conf, 0.0, 1.0))
+            cv2.rectangle(img, (bar_x1, bar_y1), (bar_x1 + fill, bar_y1 + bar_hh),
+                          inventory_state_color(state), -1)
+
+        cv2.rectangle(img, (bar_x1, bar_y1), (bar_x1 + bar_w, bar_y1 + bar_hh), (80, 80, 90), 1)
+
+        sx = x + 220
+        sy = yy - 20
+        draw_chip(img, sx, sy, state, inventory_state_color(state), scale=0.46)
+
+        if state == "MISPLACED":
+            zone_text = f"seen:{zone}" if zone else "seen:-"
+            exp_text = f"expected:{expected}"
+        elif state == "ON_BENCH":
+            zone_text = f"conf:{conf:.2f}"
+            exp_text = ""
+        else:
+            zone_text = ""
+            exp_text = ""
+
+        if zone_text:
+            cv2.putText(img, zone_text, (x + 220, yy + 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (190, 190, 190), 1, cv2.LINE_AA)
+        if exp_text:
+            cv2.putText(img, exp_text, (x + 220, yy + 24),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (150, 150, 150), 1, cv2.LINE_AA)
 
 def draw_footer(img):
     h, w = img.shape[:2]
-    blend_rect(img, 0, h - 44, w, h, (18, 18, 20), 0.74)
-    txt = "ESC=quit   TAB=select   ENTER=lock   A=auto"
-    cv2.putText(img, txt, (20, h - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (210, 210, 210), 1, cv2.LINE_AA)
+    blend_rect(img, 0, h - 42, w, h, (18, 18, 20), 0.78)
+    txt = "ESC=quit   TAB=select   ENTER=lock   A=auto   S=search   Voice: Forge wrench | Forge auto | Forge status"
+    cv2.putText(img, txt, (18, h - 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (210, 210, 210), 1, cv2.LINE_AA)
+
+def draw_notification(img, message, level="info"):
+    if not message:
+        return
+
+    h, w = img.shape[:2]
+    y = h - 72
+
+    if level == "warn":
+        col = (0, 200, 220)
+    elif level == "error":
+        col = (60, 60, 220)
+    else:
+        col = (120, 120, 120)
+
+    scale = 0.78
+    thickness = 2
+    (tw, th), _ = cv2.getTextSize(message, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+
+    x1 = (w - tw) // 2 - 20
+    x2 = (w + tw) // 2 + 20
+    y1 = y - 32
+    y2 = y + 12
+
+    blend_rect(img, x1, y1, x2, y2, (18, 18, 20), 0.88)
+    cv2.rectangle(img, (x1, y1), (x2, y2), col, 2)
+    cv2.putText(img, message, (x1 + 16, y),
+                cv2.FONT_HERSHEY_SIMPLEX, scale, (240, 240, 240), thickness, cv2.LINE_AA)
+
+def draw_search_box(img, text):
+    h, w = img.shape[:2]
+    box_w = min(720, w - 60)
+    x1 = (w - box_w) // 2
+    y1 = 100
+    x2 = x1 + box_w
+    y2 = y1 + 70
+
+    blend_rect(img, x1, y1, x2, y2, (18, 18, 20), 0.90)
+    cv2.rectangle(img, (x1, y1), (x2, y2), (0, 235, 255), 2)
+
+    cv2.putText(img, "Search tool:", (x1 + 16, y1 + 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.70, (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.putText(img, text + ("_" if int(time.time() * 2) % 2 == 0 else ""),
+                (x1 + 160, y1 + 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.78, (245, 245, 245), 2, cv2.LINE_AA)
+    cv2.putText(img, "ENTER=lock   BACKSPACE=delete   ESC=cancel",
+                (x1 + 16, y1 + 58),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (160, 160, 160), 1, cv2.LINE_AA)
 
 def resize_to_fill(img, out_w, out_h):
     h, w = img.shape[:2]
+    if w <= 0 or h <= 0:
+        return cv2.resize(img, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+
     scale = max(out_w / float(w), out_h / float(h))
-    resized = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LINEAR)
-    x0, y0 = max(0, (resized.shape[1] - out_w) // 2), max(0, (resized.shape[0] - out_h) // 2)
-    return resized[y0:y0 + out_h, x0:x0 + out_w]
+    nw = int(w * scale)
+    nh = int(h * scale)
+
+    resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+    x0 = max(0, (nw - out_w) // 2)
+    y0 = max(0, (nh - out_h) // 2)
+
+    cropped = resized[y0:y0 + out_h, x0:x0 + out_w]
+    if cropped.shape[1] != out_w or cropped.shape[0] != out_h:
+        cropped = cv2.resize(cropped, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+
+    return cropped
 
 # ----------------------------
 # REED SWITCH DEBOUNCE
@@ -311,42 +639,197 @@ class DebouncedInput:
     def read(self):
         raw = GPIO.input(self.pin)
         now = time.time()
+
         if raw != self._last_raw:
             self._last_raw = raw
             self._last_change = now
+
         if (now - self._last_change) >= self.debounce_s and self._stable != raw:
             self._stable = raw
+
         return self._stable
 
 def reed_state_to_open(stable_level, low_means_closed=True):
-    return (stable_level == GPIO.HIGH) if low_means_closed else (stable_level == GPIO.LOW)
+    if low_means_closed:
+        return stable_level == GPIO.HIGH
+    return stable_level == GPIO.LOW
 
 # ----------------------------
-# HARDWARE INITIALIZATION
+# VOICE HELPERS
+# ----------------------------
+voice_audio_queue = queue.Queue()
+voice_command_queue = queue.Queue()
+
+def canonicalize_tool_name(text):
+    q = normalize_name(text)
+    if q in SEARCH_ALIASES:
+        return SEARCH_ALIASES[q]
+    q2 = q.replace(" ", "_")
+    if q2 in FIXED_TOOL_ORDER:
+        return q2
+    return None
+
+def extract_tool_from_text(text):
+    text_n = normalize_name(text)
+
+    alias_keys = sorted(SEARCH_ALIASES.keys(), key=len, reverse=True)
+    for alias in alias_keys:
+        if alias in text_n:
+            return SEARCH_ALIASES[alias]
+
+    collapsed = text_n.replace(" ", "_")
+    for nm in FIXED_TOOL_ORDER:
+        spoken = nm.replace("_", " ")
+        if spoken in text_n or nm in collapsed:
+            return nm
+
+    return None
+
+def parse_voice_command(text):
+    t = normalize_name(text)
+    if not t:
+        return ("none", None)
+
+    wake_words = ["forge", "forage"]
+    matched_wake = None
+
+    for w in wake_words:
+        if t == w:
+            return ("wake_only", None)
+        if t.startswith(w + " "):
+            matched_wake = w
+            break
+
+    if matched_wake is None:
+        return ("none", None)
+
+    t = t[len(matched_wake):].strip()
+    if not t:
+        return ("wake_only", None)
+
+    if any(x in t for x in ["quit", "exit", "close program"]):
+        return ("quit", None)
+
+    if any(x in t for x in ["what do you see", "visible tools"]):
+        return ("summary", None)
+
+    if "status" in t:
+        return ("status", None)
+
+    if any(x in t for x in ["auto", "auto mode"]):
+        return ("auto", None)
+
+    if any(x in t for x in ["unlock", "clear lock", "stop locking"]):
+        return ("unlock", None)
+
+    if any(x in t for x in ["find", "lock", "track", "point to", "point at", "select"]):
+        tool = extract_tool_from_text(t)
+        if tool is not None:
+            return ("lock_tool", tool)
+
+    tool = canonicalize_tool_name(t)
+    if tool is not None:
+        return ("lock_tool", tool)
+
+    return ("unknown_after_wake", t)
+
+def voice_audio_callback(indata, frames, time_info, status):
+    if status:
+        print(f"[VOICE STATUS] {status}")
+    voice_audio_queue.put(bytes(indata))
+
+def voice_listener_worker():
+    try:
+        vosk_model = VoskModel(VOSK_MODEL_PATH)
+        rec = KaldiRecognizer(vosk_model, VOICE_TARGET_RATE, VOICE_GRAMMAR)
+        rec.SetWords(False)
+
+        with sd.RawInputStream(
+            samplerate=VOICE_INPUT_RATE,
+            blocksize=VOICE_BLOCKSIZE,
+            device=VOICE_DEVICE,
+            dtype="int16",
+            channels=1,
+            callback=voice_audio_callback,
+        ):
+            print("[VOICE] Listening...")
+            while True:
+                data_48k = voice_audio_queue.get()
+                if data_48k is None:
+                    break
+
+                data_16k = downsample_48k_to_16k(data_48k)
+
+                if rec.AcceptWaveform(data_16k):
+                    res = json.loads(rec.Result())
+                    text = normalize_name(res.get("text", ""))
+                    if text:
+                        print(f"[VOICE RAW] {text}")
+                        voice_command_queue.put(text)
+                else:
+                    _ = rec.PartialResult()
+
+    except Exception as e:
+        print(f"[VOICE] Failed to start: {e}")
+
+# ----------------------------
+# SETUP GPIO OUTPUTS
 # ----------------------------
 GPIO.setup(PIN_PAN, GPIO.OUT)
 GPIO.setup(PIN_TILT, GPIO.OUT)
 GPIO.setup(PIN_LASER, GPIO.OUT)
 GPIO.output(PIN_LASER, GPIO.LOW)
 
-pwm_pan  = GPIO.PWM(PIN_PAN, SERVO_HZ)
+pwm_pan = GPIO.PWM(PIN_PAN, SERVO_HZ)
 pwm_tilt = GPIO.PWM(PIN_TILT, SERVO_HZ)
 pwm_pan.start(0)
 pwm_tilt.start(0)
 
-drawer_in  = DebouncedInput(PIN_DRAWER,  pull=GPIO.PUD_UP, debounce_s=REED_DEBOUNCE_S)
+drawer_in = DebouncedInput(PIN_DRAWER, pull=GPIO.PUD_UP, debounce_s=REED_DEBOUNCE_S)
 cabinet_in = DebouncedInput(PIN_CABINET, pull=GPIO.PUD_UP, debounce_s=REED_DEBOUNCE_S)
 
+# ----------------------------
+# LOAD MODEL
+# ----------------------------
 model = YOLO(MODEL_PATH)
-name_to_id = {normalize_name(str(v)).replace(" ", "_"): int(k) for k, v in (model.names.items() if isinstance(model.names, dict) else enumerate(model.names))}
-u_list, v_list, pv = load_grid(CALIB_JSON)
 
+def class_name_from_id(cls_id: int) -> str:
+    if isinstance(model.names, dict):
+        return str(model.names.get(cls_id, cls_id))
+    return str(model.names[cls_id])
+
+name_to_id = {}
+for k, v in (model.names.items() if isinstance(model.names, dict) else enumerate(model.names)):
+    nm = normalize_name(str(v)).replace(" ", "_")
+    name_to_id[nm] = int(k)
+
+for nm in FIXED_TOOL_ORDER:
+    if nm not in name_to_id:
+        print(f"[WARN] Tool '{nm}' not found in model.names")
+
+# ----------------------------
+# LOAD GRID
+# ----------------------------
+u_list, v_list, pv = load_grid(CALIB_JSON)
+print(f"[OK] Loaded grid calibration {CALIB_JSON} ({len(u_list)}x{len(v_list)} = {len(pv)} points)")
+
+# ----------------------------
+# CAMERA SETUP
+# ----------------------------
 picam2 = Picamera2()
-config = picam2.create_video_configuration(main={"size": FRAME_SIZE, "format": "RGB888"}, transform=Transform(hflip=1, vflip=1))
+config = picam2.create_video_configuration(
+    main={"size": FRAME_SIZE, "format": "RGB888"},
+    transform=Transform(hflip=1, vflip=1),
+)
 picam2.configure(config)
 picam2.start()
 time.sleep(1.0)
 
+W, H = FRAME_SIZE
+
+# ----------------------------
+# WINDOW SETUP
+# ----------------------------
 WINDOW_NAME = "F.O.R.G.E. Demo 3"
 cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
@@ -354,200 +837,497 @@ cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREE
 SCREEN_W, SCREEN_H = 1920, 1080
 screen_size_locked = False
 
-# ----------------------------
-# STATE VARIABLES
-# ----------------------------
-W, H = FRAME_SIZE
-current_pan, current_tilt = map_xy_to_pan_tilt(W/2.0, H/2.0, W, H, u_list, v_list, pv)
+center_pan, center_tilt = map_xy_to_pan_tilt(W / 2.0, H / 2.0, W, H, u_list, v_list, pv)
+current_pan = clamp(center_pan, PAN_MIN, PAN_MAX)
+current_tilt = clamp(center_tilt, TILT_MIN, TILT_MAX)
+
 set_servo_angle(pwm_pan, current_pan)
 set_servo_angle(pwm_tilt, current_tilt)
 
-ema_x, ema_y = None, None
+print("Started. AUTO by default. TAB select, ENTER lock, A auto, S search, ESC quit.")
+
+voice_thread = None
+if VOICE_ENABLED:
+    try:
+        voice_thread = threading.Thread(target=voice_listener_worker, daemon=True)
+        voice_thread.start()
+        print("[VOICE] Voice control enabled")
+    except Exception as e:
+        print(f"[VOICE] Could not start voice thread: {e}")
+
+# ----------------------------
+# STATE
+# ----------------------------
+ema_x = None
+ema_y = None
 last_det_time = 0.0
 last_servo_update = 0.0
+
 mode = "AUTO"
 selected_idx = 0
 locked_name = None
 locked_cls_id = None
+last_locked_seen_time = 0.0
+
+auto_target_cls_id = None
+auto_target_last_seen = 0.0
+auto_target_last_switch = 0.0
+auto_target_conf = 0.0
+
+toast_msg = ""
+toast_level = "info"
+toast_until = 0.0
+
+def toast(msg, level="info", seconds=1.2):
+    global toast_msg, toast_level, toast_until
+    toast_msg = msg
+    toast_level = level
+    toast_until = time.time() + seconds
+
 last_time = time.time()
 fps = 0.0
 
+tool_state = {
+    nm: {
+        "present": False,
+        "conf": 0.0,
+        "last_seen": 0.0,
+        "zone": None,
+        "state": "OFF_BENCH",
+        "prev_state": "OFF_BENCH",
+    }
+    for nm in FIXED_TOOL_ORDER
+}
+
 prev_drawer_open = None
 prev_cabinet_open = None
-check_inventory_time = 0.0 
 
-# Enhanced Tool State Dictionary for Inventory Tracking
-tool_state = {nm: {"state": "UNKNOWN", "present": False, "conf": 0.0, "last_seen": 0.0} for nm in FIXED_TOOL_ORDER}
+search_active = False
+search_text = ""
 
 # ----------------------------
 # MAIN LOOP
 # ----------------------------
 try:
     while True:
-        frame = picam2.capture_array()  
+        frame = picam2.capture_array()
         now = time.time()
-        
-        # FPS
+
         dt = now - last_time
-        if dt > 0: fps = (1.0 / dt) if fps <= 0 else (0.85 * fps + 0.15 * (1.0 / dt))
+        if dt > 0:
+            inst = 1.0 / dt
+            fps = inst if fps <= 0 else (0.85 * fps + 0.15 * inst)
         last_time = now
 
-        # --- PROCESS VOICE COMMANDS ---
-        try:
-            v_cmd, v_args = voice_cmd_queue.get_nowait()
-            if v_cmd == "LOCATE":
-                cls_id = name_to_id.get(v_args, None)
-                if cls_id is not None:
-                    mode = "LOCK"
-                    locked_name = v_args
-                    locked_cls_id = cls_id
-                    state = tool_state[v_args]["state"]
-                    
-                    if state == "ON_BENCH":
-                        tts_queue.put(f"The {v_args.replace('_', ' ')} is on the bench. Pointing now.")
-                    elif state == "IN_DRAWER":
-                        tts_queue.put(f"The {v_args.replace('_', ' ')} is currently stored in the drawer.")
-                    else:
-                        tts_queue.put(f"I cannot locate the {v_args.replace('_', ' ')}.")
-                        
-            elif v_cmd == "REPORT":
-                missing = [t.replace("_", " ") for t, data in tool_state.items() if data["state"] == "UNKNOWN"]
-                if missing:
-                    tts_queue.put(f"The following tools are unaccounted for: {', '.join(missing)}")
-                else:
-                    tts_queue.put("All tools are accounted for.")
-        except queue.Empty:
-            pass
+        while not voice_command_queue.empty():
+            spoken = voice_command_queue.get().strip()
+            cmd, arg = parse_voice_command(spoken)
 
-        # --- READ REED SWITCHES & INVENTORY TRANSITION ---
-        drawer_open = reed_state_to_open(drawer_in.read(), DRAWER_LOW_MEANS_CLOSED)
-        cabinet_open = reed_state_to_open(cabinet_in.read(), CABINET_LOW_MEANS_CLOSED)
-        
-        if prev_drawer_open is None: prev_drawer_open = drawer_open
-        if prev_cabinet_open is None: prev_cabinet_open = cabinet_open
-        
-        # Drawer just closed -> Scan inventory after 1.5s delay
+            print(f"[VOICE] Heard: {spoken}")
+
+            if cmd == "lock_tool":
+                cls_id = name_to_id.get(arg)
+                if cls_id is None:
+                    toast(f"Voice tool not in model: {arg}", "error", 1.4)
+                else:
+                    mode = "LOCK"
+                    locked_name = arg
+                    locked_cls_id = cls_id
+                    last_locked_seen_time = now
+                    if arg in FIXED_TOOL_ORDER:
+                        selected_idx = FIXED_TOOL_ORDER.index(arg)
+                    toast(f"FORGE LOCK: {locked_name}", "info", 1.2)
+
+            elif cmd == "auto":
+                mode = "AUTO"
+                locked_name = None
+                locked_cls_id = None
+                toast("FORGE: AUTO mode", "info", 1.0)
+
+            elif cmd == "unlock":
+                mode = "AUTO"
+                locked_name = None
+                locked_cls_id = None
+                toast("FORGE: lock cleared", "info", 1.0)
+
+            elif cmd == "summary":
+                visible = [nm for nm in FIXED_TOOL_ORDER if tool_state[nm]["state"] != "OFF_BENCH"]
+                if visible:
+                    toast("Visible: " + ", ".join(visible[:4]), "info", 1.5)
+                else:
+                    toast("No tools visible", "warn", 1.2)
+
+            elif cmd == "status":
+                d = "open" if prev_drawer_open else "closed"
+                c = "open" if prev_cabinet_open else "closed"
+                toast(f"Drawer {d}, cabinet {c}", "info", 1.3)
+
+            elif cmd == "wake_only":
+                toast("Yes?", "info", 1.2)
+
+            elif cmd == "quit":
+                toast("FORGE: quitting", "warn", 0.8)
+                raise KeyboardInterrupt
+
+            elif cmd == "unknown_after_wake":
+                toast(f"Unknown command: {arg}", "warn", 1.0)
+
+        drawer_level = drawer_in.read()
+        cabinet_level = cabinet_in.read()
+
+        drawer_open = reed_state_to_open(drawer_level, low_means_closed=DRAWER_LOW_MEANS_CLOSED)
+        cabinet_open = reed_state_to_open(cabinet_level, low_means_closed=CABINET_LOW_MEANS_CLOSED)
+
+        if prev_drawer_open is None:
+            prev_drawer_open = drawer_open
+        if prev_cabinet_open is None:
+            prev_cabinet_open = cabinet_open
+
         if drawer_open != prev_drawer_open:
-            if not drawer_open: 
-                check_inventory_time = now + 1.5 
-                tts_queue.put("Drawer closed. Scanning inventory.")
+            toast("Drawer opened" if drawer_open else "Drawer closed", "info", 1.1)
             prev_drawer_open = drawer_open
 
-        # Execute Inventory Scan
-        if check_inventory_time > 0 and now > check_inventory_time:
-            check_inventory_time = 0.0
-            for nm in FIXED_TOOL_ORDER:
-                if tool_state[nm]["state"] == "ON_BENCH" and not tool_state[nm]["present"]:
-                    tool_state[nm]["state"] = "IN_DRAWER"
-                    
-        # --- YOLO INFERENCE ---
+        if cabinet_open != prev_cabinet_open:
+            toast("Cabinet opened" if cabinet_open else "Cabinet closed", "info", 1.1)
+            prev_cabinet_open = cabinet_open
+
         results = model(frame, imgsz=INFER_SIZE, conf=0.25, verbose=False)
         r = results[0]
-        
-        best_by_cls = {} 
-        best_overall = None 
-        
+
+        best_by_cls = {}
+        best_overall = None
+
         if r.boxes is not None and len(r.boxes):
             for box in r.boxes:
-                conf, cls_id = float(box.conf[0]), int(box.cls[0])
-                nm = normalize_name(str(model.names.get(cls_id, cls_id))).replace(" ", "_")
-                
-                if conf < CONF_THRESH_BY_NAME.get(nm, CONF_THRESH_GLOBAL): continue
-                
-                cx, cy = (box.xyxy[0][0] + box.xyxy[0][2]) / 2.0, (box.xyxy[0][1] + box.xyxy[0][3]) / 2.0
-                
-                if best_overall is None or conf > best_overall[0]:
-                    best_overall = (conf, cx, cy, nm, cls_id)
-                if cls_id not in best_by_cls or conf > best_by_cls[cls_id][0]:
-                    best_by_cls[cls_id] = (conf, cx, cy, nm)
+                conf = float(box.conf[0])
+                cls_id = int(box.cls[0])
+                name_raw = class_name_from_id(cls_id)
+                name_norm = normalize_name(str(name_raw)).replace(" ", "_")
 
-        # Update Vision Presence
-        for nm in FIXED_TOOL_ORDER: tool_state[nm]["present"] = False
-        
+                th = CONF_THRESH_BY_NAME.get(name_norm, CONF_THRESH_GLOBAL)
+                if conf < th:
+                    continue
+
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                cx = (x1 + x2) / 2.0
+                cy = (y1 + y2) / 2.0
+
+                if (best_overall is None) or (conf > best_overall[0]):
+                    best_overall = (conf, cx, cy, name_norm, cls_id)
+
+                prev = best_by_cls.get(cls_id)
+                if (prev is None) or (conf > prev[0]):
+                    best_by_cls[cls_id] = (conf, cx, cy, name_norm)
+
+        for nm in FIXED_TOOL_ORDER:
+            tool_state[nm]["present"] = False
+
         for cls_id, (conf, cx, cy, nm) in best_by_cls.items():
             if nm in tool_state:
+                u = clamp(cx / float(W), 0.0, 1.0)
+                zone = get_horizontal_zone(u)
+
                 tool_state[nm]["conf"] = conf
                 tool_state[nm]["last_seen"] = now
                 tool_state[nm]["present"] = True
-                tool_state[nm]["state"] = "ON_BENCH" # If we see it, it is definitively on the bench
-                
-        # Persistence Logic
-        for nm in FIXED_TOOL_ORDER:
-            if (now - tool_state[nm]["last_seen"]) <= PRESENCE_HOLD_S:
-                tool_state[nm]["present"] = tool_state[nm]["last_seen"] > 0
+                tool_state[nm]["zone"] = zone
 
-        # --- TARGET SELECTION ---
-        best = None 
+        for nm in FIXED_TOOL_ORDER:
+            st = tool_state[nm]
+            last_seen = st["last_seen"]
+            age = now - last_seen if last_seen > 0 else 1e9
+
+            st["present"] = (last_seen > 0 and age <= PRESENCE_HOLD_S)
+
+            if age > INVENTORY_HOLD_S:
+                st["conf"] = 0.0
+                st["zone"] = None
+
+            st["prev_state"] = st["state"]
+            st["state"] = classify_inventory_state(nm, now, st)
+
+            if MISPLACED_TOASTS and st["state"] != st["prev_state"]:
+                if st["state"] == "MISPLACED":
+                    toast(f"{nm} misplaced", "warn", 1.0)
+                elif st["state"] == "OFF_BENCH" and st["prev_state"] != "OFF_BENCH":
+                    toast(f"{nm} off bench", "info", 0.9)
+                elif st["state"] == "ON_BENCH" and st["prev_state"] != "ON_BENCH":
+                    toast(f"{nm} on bench", "info", 0.9)
+
+        best = None
+
         if mode == "LOCK" and locked_cls_id is not None:
-            if locked_cls_id in best_by_cls: best = (*best_by_cls[locked_cls_id], locked_cls_id)
+            if locked_cls_id in best_by_cls:
+                conf, cx, cy, nm = best_by_cls[locked_cls_id]
+                best = (conf, cx, cy, nm, locked_cls_id)
         else:
             if best_overall is not None:
-                best = best_overall
+                new_conf, new_cx, new_cy, new_nm, new_id = best_overall
 
-        # --- LASER & SERVO CONTROL ---
-        laser_state = False
+                current_visible = False
+                current_conf = 0.0
+
+                if auto_target_cls_id is not None and auto_target_cls_id in best_by_cls:
+                    current_visible = True
+                    current_conf, current_cx, current_cy, current_nm = best_by_cls[auto_target_cls_id]
+                    auto_target_last_seen = now
+                else:
+                    if auto_target_cls_id is not None and (now - auto_target_last_seen) <= AUTO_TARGET_GRACE_S:
+                        current_visible = False
+                    else:
+                        auto_target_cls_id = None
+
+                if auto_target_cls_id is None:
+                    auto_target_cls_id = new_id
+                    auto_target_conf = new_conf
+                    auto_target_last_seen = now
+                    auto_target_last_switch = now
+                else:
+                    can_switch_time = (now - auto_target_last_switch) >= AUTO_SWITCH_HOLD_S
+                    if can_switch_time:
+                        if (new_id != auto_target_cls_id) and (new_conf >= (auto_target_conf + AUTO_SWITCH_MARGIN)):
+                            auto_target_cls_id = new_id
+                            auto_target_conf = new_conf
+                            auto_target_last_seen = now
+                            auto_target_last_switch = now
+
+                    if current_visible:
+                        auto_target_conf = current_conf
+
+                if auto_target_cls_id is not None and auto_target_cls_id in best_by_cls:
+                    conf, cx, cy, nm = best_by_cls[auto_target_cls_id]
+                    best = (conf, cx, cy, nm, auto_target_cls_id)
+
+        laser_state = (GPIO.input(PIN_LASER) == GPIO.HIGH)
+
+        if mode == "LOCK" and locked_cls_id is not None:
+            if best is not None:
+                last_locked_seen_time = now
+                last_det_time = now
+                GPIO.output(PIN_LASER, GPIO.HIGH)
+                laser_state = True
+            else:
+                lost_for = now - last_locked_seen_time
+                if lost_for > LOCK_LOST_TIMEOUT:
+                    GPIO.output(PIN_LASER, GPIO.LOW)
+                    laser_state = False
+                    ema_x = None
+                    ema_y = None
+                else:
+                    laser_state = (GPIO.input(PIN_LASER) == GPIO.HIGH)
+        else:
+            if best is not None:
+                last_det_time = now
+                GPIO.output(PIN_LASER, GPIO.HIGH)
+                laser_state = True
+            else:
+                if (now - last_det_time) > NO_DET_TIMEOUT:
+                    GPIO.output(PIN_LASER, GPIO.LOW)
+                    laser_state = False
+                    ema_x = None
+                    ema_y = None
+                else:
+                    laser_state = (GPIO.input(PIN_LASER) == GPIO.HIGH)
+
         if best is not None:
-            last_det_time = now
-            GPIO.output(PIN_LASER, GPIO.HIGH)
-            laser_state = True
-            
             conf, cx, cy, nm, cls_id = best
-            ema_x = cx if ema_x is None else EMA_ALPHA * cx + (1.0 - EMA_ALPHA) * ema_x
-            ema_y = cy if ema_y is None else EMA_ALPHA * cy + (1.0 - EMA_ALPHA) * ema_y
-            
+
+            if ema_x is None:
+                ema_x, ema_y = cx, cy
+            else:
+                ema_x = EMA_ALPHA * cx + (1.0 - EMA_ALPHA) * ema_x
+                ema_y = EMA_ALPHA * cy + (1.0 - EMA_ALPHA) * ema_y
+
             target_pan, target_tilt = map_xy_to_pan_tilt(ema_x, ema_y, W, H, u_list, v_list, pv)
+
             if (now - last_servo_update) >= SERVO_UPDATE_PERIOD:
+                moved = False
+
                 if abs(target_pan - current_pan) >= DEADBAND_DEG:
                     current_pan = target_pan
                     set_servo_angle(pwm_pan, current_pan)
+                    moved = True
+
                 if abs(target_tilt - current_tilt) >= DEADBAND_DEG:
                     current_tilt = target_tilt
                     set_servo_angle(pwm_tilt, current_tilt)
-                last_servo_update = now
-        else:
-            if (now - last_det_time) > NO_DET_TIMEOUT:
-                GPIO.output(PIN_LASER, GPIO.LOW)
-                ema_x, ema_y = None, None
+                    moved = True
 
-        # --- RENDER ---
-        annotated = r.plot()  
+                if moved:
+                    last_servo_update = now
+
+        annotated = r.plot()
+
         if not screen_size_locked:
-            cv2.imshow(WINDOW_NAME, cv2.resize(annotated, (SCREEN_W, SCREEN_H)))
+            temp = cv2.resize(annotated, (SCREEN_W, SCREEN_H), interpolation=cv2.INTER_LINEAR)
+            cv2.imshow(WINDOW_NAME, temp)
             cv2.waitKey(1)
             try:
                 rx, ry, rw, rh = cv2.getWindowImageRect(WINDOW_NAME)
-                if rw > 200: SCREEN_W, SCREEN_H, screen_size_locked = rw, rh, True
-            except: pass
+                if rw > 200 and rh > 200:
+                    SCREEN_W, SCREEN_H = rw, rh
+                    screen_size_locked = True
+            except Exception:
+                pass
 
         display = resize_to_fill(annotated, SCREEN_W, SCREEN_H)
-        
-        if best is not None and ema_x is not None:
-            scale = max(SCREEN_W / float(W), SCREEN_H / float(H))
-            tx = ema_x * scale - ((W * scale - SCREEN_W) / 2.0)
-            ty = ema_y * scale - ((H * scale - SCREEN_H) / 2.0)
-            draw_crosshair(display, tx, ty, laser_state)
 
-        draw_status_bar(display, mode, locked_name if locked_name else "none", laser_state, current_pan, current_tilt, fps, drawer_open, cabinet_open)
+        if best is not None and ema_x is not None and ema_y is not None:
+            scale = max(SCREEN_W / float(W), SCREEN_H / float(H))
+            nw = W * scale
+            nh = H * scale
+            x0 = (nw - SCREEN_W) / 2.0
+            y0 = (nh - SCREEN_H) / 2.0
+
+            tx = ema_x * scale - x0
+            ty = ema_y * scale - y0
+
+            draw_crosshair(display, tx, ty, laser_state)
+            label = f"{best[3]}  {best[0]:.2f}"
+            cv2.putText(display, label, (int(tx + 18), int(ty - 18)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.92, (245, 245, 245), 2, cv2.LINE_AA)
+
+        draw_status_bar(
+            display,
+            mode,
+            locked_name if locked_name else "none",
+            laser_state,
+            current_pan,
+            current_tilt,
+            fps,
+            drawer_open,
+            cabinet_open,
+            tool_state,
+        )
+
         draw_tool_panel(display, FIXED_TOOL_ORDER, selected_idx, locked_name, mode, tool_state)
         draw_footer(display)
-        
+
+        if toast_msg and time.time() < toast_until:
+            draw_notification(display, toast_msg, toast_level)
+
+        if search_active:
+            draw_search_box(display, search_text)
+
         cv2.imshow(WINDOW_NAME, display)
         key = cv2.waitKey(1) & 0xFF
-        
-        # Key Controls
-        if key == 27: break
-        elif key == 9: selected_idx = (selected_idx + 1) % len(FIXED_TOOL_ORDER)
-        elif key in (10, 13): 
-            mode, locked_name, locked_cls_id = "LOCK", FIXED_TOOL_ORDER[selected_idx], name_to_id.get(FIXED_TOOL_ORDER[selected_idx], None)
-        elif key in (ord('a'), ord('A')): 
-            mode, locked_name, locked_cls_id = "AUTO", None, None
+
+        if key == 27:
+            if search_active:
+                search_active = False
+                search_text = ""
+                toast("Search cancelled", "warn", 0.9)
+            else:
+                break
+
+        if search_active:
+            if key in (10, 13):
+                q = normalize_name(search_text)
+                canonical = None
+
+                if q in SEARCH_ALIASES:
+                    canonical = SEARCH_ALIASES[q]
+                else:
+                    q2 = q.replace(" ", "_")
+                    if q2 in FIXED_TOOL_ORDER:
+                        canonical = q2
+
+                if canonical is None:
+                    toast(f"Unknown tool: '{search_text}'", "warn", 1.3)
+                else:
+                    locked_name = canonical
+                    locked_cls_id = name_to_id.get(canonical, None)
+
+                    if locked_cls_id is None:
+                        toast(f"Tool '{canonical}' not in model", "error", 1.4)
+                        mode = "AUTO"
+                        locked_name = None
+                        locked_cls_id = None
+                    else:
+                        mode = "LOCK"
+                        last_locked_seen_time = now
+                        toast(f"LOCK: {locked_name}", "info", 1.0)
+
+                search_active = False
+                search_text = ""
+                continue
+
+            if key in (8, 127):
+                search_text = search_text[:-1]
+                continue
+
+            if 32 <= key <= 126:
+                ch = chr(key)
+                if ch.isalnum() or ch in (" ", "_", "-"):
+                    if len(search_text) < 22:
+                        search_text += ch
+                continue
+
+            continue
+
+        if key == 9:
+            selected_idx = (selected_idx + 1) % len(FIXED_TOOL_ORDER)
+
+        elif key in (10, 13):
+            nm = FIXED_TOOL_ORDER[selected_idx]
+            cls_id = name_to_id.get(nm, None)
+
+            if cls_id is None:
+                toast(f"Tool '{nm}' not in model", "error", 1.4)
+            else:
+                mode = "LOCK"
+                locked_name = nm
+                locked_cls_id = cls_id
+                last_locked_seen_time = now
+                toast(f"LOCK: {locked_name}", "info", 1.0)
+
+        elif key in (ord('a'), ord('A')):
+            mode = "AUTO"
+            locked_name = None
+            locked_cls_id = None
+            toast("MODE: AUTO", "info", 1.0)
+
+        elif key in (ord('s'), ord('S')):
+            search_active = True
+            search_text = ""
+            toast("Search: type tool name", "info", 1.0)
+
+        elif key in (ord('l'), ord('L')):
+            if mode == "LOCK":
+                mode = "AUTO"
+                locked_name = None
+                locked_cls_id = None
+                toast("MODE: AUTO", "info", 1.0)
+            else:
+                nm = FIXED_TOOL_ORDER[selected_idx]
+                cls_id = name_to_id.get(nm, None)
+                if cls_id is not None:
+                    mode = "LOCK"
+                    locked_name = nm
+                    locked_cls_id = cls_id
+                    last_locked_seen_time = now
+                    toast(f"LOCK: {locked_name}", "info", 1.0)
 
 finally:
     GPIO.output(PIN_LASER, GPIO.LOW)
+
     try:
-        pwm_pan.ChangeDutyCycle(0); pwm_tilt.ChangeDutyCycle(0)
-        pwm_pan.stop(); pwm_tilt.stop()
-    except: pass
+        voice_audio_queue.put(None)
+    except Exception:
+        pass
+
+    try:
+        pwm_pan.ChangeDutyCycle(0)
+        pwm_tilt.ChangeDutyCycle(0)
+        pwm_pan.stop()
+        pwm_tilt.stop()
+    except Exception:
+        pass
+
     GPIO.cleanup()
     cv2.destroyAllWindows()
-    picam2.stop()
+
+    try:
+        picam2.stop()
+    except Exception:
+        pass
