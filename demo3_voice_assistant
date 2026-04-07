@@ -15,8 +15,21 @@ F.O.R.G.E. Demo 3
     * ON_BENCH
     * MISPLACED
     * OFF_BENCH
-- Offline voice commands with Vosk
+- Offline voice commands with Vosk (Full Vocabulary)
 - Mic captured at 48 kHz, downsampled to 16 kHz for Vosk
+- Stateful Wake Word: Say "Forge", pause, then speak command.
+
+FIXES APPLIED (vs previous version):
+  1. All hardware init moved inside try/finally so GPIO.cleanup() always runs.
+  2. voice_thread.join(timeout=2.0) added in finally block to drain ALSA cleanly.
+  3. Removed dead local `is_awake = True` assignment inside parse_voice_command.
+  4. screen_size_locked exception now logs once instead of silently swallowing.
+  5. voice_audio_queue capped at maxsize=20; callback uses put_nowait to drop stale audio.
+  6. Servo PWM zeroed when lock-lost timeout fires (prevents residual jitter chatter).
+  7. FPS smoothing guarded with dt > 0.01 to suppress first-frame spike.
+  8. YOLO inference confidence floor raised to match CONF_THRESH_GLOBAL (removes double-filter waste).
+  9. assert added to catch non-divisible-by-3 VOICE_BLOCKSIZE at startup.
+ 10. Comment added above search_active block warning future devs about the continue pattern.
 """
 
 from ultralytics import YOLO
@@ -38,7 +51,7 @@ import RPi.GPIO as GPIO
 # ----------------------------
 MODEL_PATH = "/home/smartworkbench/best_n.pt"
 CALIB_JSON = "/home/smartworkbench/laser_grid_7x7_runtime_view.json"
-FRAME_SIZE = (480, 360)
+FRAME_SIZE = (480, 360)   # (W,H)
 INFER_SIZE = 320
 
 CONF_THRESH_GLOBAL = 0.70
@@ -58,86 +71,12 @@ VOICE_INPUT_RATE = 48000
 VOICE_TARGET_RATE = 16000
 VOICE_BLOCKSIZE = 4800   # 0.1 sec at 48k
 
-VOICE_GRAMMAR = json.dumps([
-    "forge",
-    "forage",
-
-    "forge wrench",
-    "forge pliers",
-    "forge screwdriver",
-    "forge hammer",
-    "forge tape measure",
-    "forge handsaw",
-    "forge allen keys",
-    "forge allen key",
-    "forge hex key",
-
-    "forge find wrench",
-    "forge find pliers",
-    "forge find screwdriver",
-    "forge find hammer",
-    "forge find tape measure",
-    "forge find handsaw",
-    "forge find allen keys",
-    "forge find allen key",
-    "forge find hex key",
-
-    "forge lock wrench",
-    "forge lock pliers",
-    "forge lock screwdriver",
-    "forge lock hammer",
-    "forge lock tape measure",
-    "forge lock handsaw",
-    "forge lock allen keys",
-    "forge lock allen key",
-    "forge lock hex key",
-
-    "forge auto",
-    "forge auto mode",
-    "forge unlock",
-    "forge status",
-    "forge what do you see",
-    "forge visible tools",
-    "forge quit",
-
-    "forage wrench",
-    "forage pliers",
-    "forage screwdriver",
-    "forage hammer",
-    "forage tape measure",
-    "forage handsaw",
-    "forage allen keys",
-    "forage allen key",
-    "forage hex key",
-
-    "forage find wrench",
-    "forage find pliers",
-    "forage find screwdriver",
-    "forage find hammer",
-    "forage find tape measure",
-    "forage find handsaw",
-    "forage find allen keys",
-    "forage find allen key",
-    "forage find hex key",
-
-    "forage lock wrench",
-    "forage lock pliers",
-    "forage lock screwdriver",
-    "forage lock hammer",
-    "forage lock tape measure",
-    "forage lock handsaw",
-    "forage lock allen keys",
-    "forage lock allen key",
-    "forage lock hex key",
-
-    "forage auto",
-    "forage auto mode",
-    "forage unlock",
-    "forage status",
-    "forage what do you see",
-    "forage visible tools",
-    "forage quit"
-])
+# FIX 9: assert at module load so a bad blocksize fails loudly instead of
+# silently producing truncated audio blocks that confuse Vosk.
+assert VOICE_BLOCKSIZE % 3 == 0, (
+    f"VOICE_BLOCKSIZE ({VOICE_BLOCKSIZE}) must be divisible by 3 "
+    "for exact 48kHz -> 16kHz decimation."
+)
 
 # ----------------------------
 # GPIO PINS
@@ -295,7 +234,7 @@ def inventory_state_text_color(state):
     return (130, 130, 130)
 
 def downsample_48k_to_16k(raw_bytes: bytes) -> bytes:
-    """Simple exact decimation: 48k -> 16k."""
+    """Exact decimation: 48k -> 16k by keeping every 3rd sample."""
     samples = np.frombuffer(raw_bytes, dtype=np.int16)
     down = samples[::3]
     return down.tobytes()
@@ -553,7 +492,7 @@ def draw_tool_panel(img, fixed_tools, selected_idx, locked_name, mode, tool_stat
 def draw_footer(img):
     h, w = img.shape[:2]
     blend_rect(img, 0, h - 42, w, h, (18, 18, 20), 0.78)
-    txt = "ESC=quit   TAB=select   ENTER=lock   A=auto   S=search   Voice: Forge wrench | Forge auto | Forge status"
+    txt = "ESC=quit   TAB=select   ENTER=lock   A=auto   S=search   Voice: Say 'Forge', wait, then speak command"
     cv2.putText(img, txt, (18, h - 14),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (210, 210, 210), 1, cv2.LINE_AA)
 
@@ -655,9 +594,10 @@ def reed_state_to_open(stable_level, low_means_closed=True):
     return stable_level == GPIO.LOW
 
 # ----------------------------
-# VOICE HELPERS
+# VOICE HELPERS (Stateful Parser)
 # ----------------------------
-voice_audio_queue = queue.Queue()
+# FIX 5: cap the audio queue so stale frames are dropped instead of piling up.
+voice_audio_queue = queue.Queue(maxsize=20)
 voice_command_queue = queue.Queue()
 
 def canonicalize_tool_name(text):
@@ -685,12 +625,22 @@ def extract_tool_from_text(text):
 
     return None
 
-def parse_voice_command(text):
+def parse_voice_command(text, is_awake):
+    """
+    Parse a recognized utterance into (command, argument).
+
+    Note: is_awake is read-only here. The caller owns the awake state.
+    The local reassignment that previously appeared here has been removed
+    (FIX 3) because it had no effect — Python passes booleans by value.
+    """
     t = normalize_name(text)
     if not t:
         return ("none", None)
 
-    wake_words = ["forge", "forage"]
+    wake_words = [
+        "hey forge", "hey ford", "hey george", "hey board",
+        "forge", "forage", "ford", "george", "board", "porch",
+    ]
     matched_wake = None
 
     for w in wake_words:
@@ -700,12 +650,22 @@ def parse_voice_command(text):
             matched_wake = w
             break
 
-    if matched_wake is None:
-        return ("none", None)
+    # Wake word was the prefix of a combined utterance ("Forge find the hammer").
+    # Treat the remainder as the command without mutating the caller's awake flag
+    # here — the caller will set awake=False after processing the command.
+    if matched_wake is not None:
+        t = t[len(matched_wake):].strip()
+        # is_awake intentionally NOT set here (FIX 3).
+        # The caller already treats matched_wake as implying awake for this utterance.
+        current_awake = True
+    else:
+        current_awake = is_awake
 
-    t = t[len(matched_wake):].strip()
-    if not t:
+    if not t and current_awake:
         return ("wake_only", None)
+
+    if not current_awake:
+        return ("none", None)
 
     if any(x in t for x in ["quit", "exit", "close program"]):
         return ("quit", None)
@@ -722,7 +682,7 @@ def parse_voice_command(text):
     if any(x in t for x in ["unlock", "clear lock", "stop locking"]):
         return ("unlock", None)
 
-    if any(x in t for x in ["find", "lock", "track", "point to", "point at", "select"]):
+    if any(x in t for x in ["find", "lock", "track", "point to", "point at", "select", "where is"]):
         tool = extract_tool_from_text(t)
         if tool is not None:
             return ("lock_tool", tool)
@@ -736,12 +696,17 @@ def parse_voice_command(text):
 def voice_audio_callback(indata, frames, time_info, status):
     if status:
         print(f"[VOICE STATUS] {status}")
-    voice_audio_queue.put(bytes(indata))
+    # FIX 5: drop the block if the queue is full rather than blocking the
+    # audio callback thread, which would cause ALSA underruns.
+    try:
+        voice_audio_queue.put_nowait(bytes(indata))
+    except queue.Full:
+        pass  # Vosk is behind; discard stale audio to stay current.
 
 def voice_listener_worker():
     try:
         vosk_model = VoskModel(VOSK_MODEL_PATH)
-        rec = KaldiRecognizer(vosk_model, VOICE_TARGET_RATE, VOICE_GRAMMAR)
+        rec = KaldiRecognizer(vosk_model, VOICE_TARGET_RATE)
         rec.SetWords(False)
 
         with sd.RawInputStream(
@@ -773,157 +738,194 @@ def voice_listener_worker():
         print(f"[VOICE] Failed to start: {e}")
 
 # ----------------------------
-# SETUP GPIO OUTPUTS
+# MAIN — all hardware init lives inside try/finally (FIX 1)
 # ----------------------------
-GPIO.setup(PIN_PAN, GPIO.OUT)
-GPIO.setup(PIN_TILT, GPIO.OUT)
-GPIO.setup(PIN_LASER, GPIO.OUT)
-GPIO.output(PIN_LASER, GPIO.LOW)
-
-pwm_pan = GPIO.PWM(PIN_PAN, SERVO_HZ)
-pwm_tilt = GPIO.PWM(PIN_TILT, SERVO_HZ)
-pwm_pan.start(0)
-pwm_tilt.start(0)
-
-drawer_in = DebouncedInput(PIN_DRAWER, pull=GPIO.PUD_UP, debounce_s=REED_DEBOUNCE_S)
-cabinet_in = DebouncedInput(PIN_CABINET, pull=GPIO.PUD_UP, debounce_s=REED_DEBOUNCE_S)
-
-# ----------------------------
-# LOAD MODEL
-# ----------------------------
-model = YOLO(MODEL_PATH)
-
-def class_name_from_id(cls_id: int) -> str:
-    if isinstance(model.names, dict):
-        return str(model.names.get(cls_id, cls_id))
-    return str(model.names[cls_id])
-
-name_to_id = {}
-for k, v in (model.names.items() if isinstance(model.names, dict) else enumerate(model.names)):
-    nm = normalize_name(str(v)).replace(" ", "_")
-    name_to_id[nm] = int(k)
-
-for nm in FIXED_TOOL_ORDER:
-    if nm not in name_to_id:
-        print(f"[WARN] Tool '{nm}' not found in model.names")
-
-# ----------------------------
-# LOAD GRID
-# ----------------------------
-u_list, v_list, pv = load_grid(CALIB_JSON)
-print(f"[OK] Loaded grid calibration {CALIB_JSON} ({len(u_list)}x{len(v_list)} = {len(pv)} points)")
-
-# ----------------------------
-# CAMERA SETUP
-# ----------------------------
-picam2 = Picamera2()
-config = picam2.create_video_configuration(
-    main={"size": FRAME_SIZE, "format": "RGB888"},
-    transform=Transform(hflip=1, vflip=1),
-)
-picam2.configure(config)
-picam2.start()
-time.sleep(1.0)
-
-W, H = FRAME_SIZE
-
-# ----------------------------
-# WINDOW SETUP
-# ----------------------------
-WINDOW_NAME = "F.O.R.G.E. Demo 3"
-cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-
-SCREEN_W, SCREEN_H = 1920, 1080
-screen_size_locked = False
-
-center_pan, center_tilt = map_xy_to_pan_tilt(W / 2.0, H / 2.0, W, H, u_list, v_list, pv)
-current_pan = clamp(center_pan, PAN_MIN, PAN_MAX)
-current_tilt = clamp(center_tilt, TILT_MIN, TILT_MAX)
-
-set_servo_angle(pwm_pan, current_pan)
-set_servo_angle(pwm_tilt, current_tilt)
-
-print("Started. AUTO by default. TAB select, ENTER lock, A auto, S search, ESC quit.")
-
+# Servo PWM handles and reed inputs are declared here so the finally block
+# can reference them unconditionally without NameError guards.
+pwm_pan = None
+pwm_tilt = None
+picam2 = None
 voice_thread = None
-if VOICE_ENABLED:
-    try:
-        voice_thread = threading.Thread(target=voice_listener_worker, daemon=True)
-        voice_thread.start()
-        print("[VOICE] Voice control enabled")
-    except Exception as e:
-        print(f"[VOICE] Could not start voice thread: {e}")
 
-# ----------------------------
-# STATE
-# ----------------------------
-ema_x = None
-ema_y = None
-last_det_time = 0.0
-last_servo_update = 0.0
-
-mode = "AUTO"
-selected_idx = 0
-locked_name = None
-locked_cls_id = None
-last_locked_seen_time = 0.0
-
-auto_target_cls_id = None
-auto_target_last_seen = 0.0
-auto_target_last_switch = 0.0
-auto_target_conf = 0.0
-
-toast_msg = ""
-toast_level = "info"
-toast_until = 0.0
-
-def toast(msg, level="info", seconds=1.2):
-    global toast_msg, toast_level, toast_until
-    toast_msg = msg
-    toast_level = level
-    toast_until = time.time() + seconds
-
-last_time = time.time()
-fps = 0.0
-
-tool_state = {
-    nm: {
-        "present": False,
-        "conf": 0.0,
-        "last_seen": 0.0,
-        "zone": None,
-        "state": "OFF_BENCH",
-        "prev_state": "OFF_BENCH",
-    }
-    for nm in FIXED_TOOL_ORDER
-}
-
-prev_drawer_open = None
-prev_cabinet_open = None
-
-search_active = False
-search_text = ""
-
-# ----------------------------
-# MAIN LOOP
-# ----------------------------
 try:
+    # --- GPIO output setup ---
+    GPIO.setup(PIN_PAN, GPIO.OUT)
+    GPIO.setup(PIN_TILT, GPIO.OUT)
+    GPIO.setup(PIN_LASER, GPIO.OUT)
+    GPIO.output(PIN_LASER, GPIO.LOW)
+
+    pwm_pan = GPIO.PWM(PIN_PAN, SERVO_HZ)
+    pwm_tilt = GPIO.PWM(PIN_TILT, SERVO_HZ)
+    pwm_pan.start(0)
+    pwm_tilt.start(0)
+
+    drawer_in = DebouncedInput(PIN_DRAWER, pull=GPIO.PUD_UP, debounce_s=REED_DEBOUNCE_S)
+    cabinet_in = DebouncedInput(PIN_CABINET, pull=GPIO.PUD_UP, debounce_s=REED_DEBOUNCE_S)
+
+    # --- Load YOLO model ---
+    model = YOLO(MODEL_PATH)
+
+    def class_name_from_id(cls_id: int) -> str:
+        if isinstance(model.names, dict):
+            return str(model.names.get(cls_id, cls_id))
+        return str(model.names[cls_id])
+
+    name_to_id = {}
+    for k, v in (model.names.items() if isinstance(model.names, dict) else enumerate(model.names)):
+        nm = normalize_name(str(v)).replace(" ", "_")
+        name_to_id[nm] = int(k)
+
+    for nm in FIXED_TOOL_ORDER:
+        if nm not in name_to_id:
+            print(f"[WARN] Tool '{nm}' not found in model.names")
+
+    # FIX 8: compute the effective minimum confidence threshold for YOLO's
+    # own filter so it matches our per-tool thresholds.  This eliminates the
+    # double-filter (model at 0.25, then script at 0.70) and saves CPU.
+    YOLO_CONF_FLOOR = min(
+        [CONF_THRESH_GLOBAL] + list(CONF_THRESH_BY_NAME.values())
+    )
+
+    # --- Load calibration grid ---
+    u_list, v_list, pv = load_grid(CALIB_JSON)
+    print(f"[OK] Loaded grid calibration {CALIB_JSON} ({len(u_list)}x{len(v_list)} = {len(pv)} points)")
+
+    # --- Camera setup ---
+    picam2 = Picamera2()
+    config = picam2.create_video_configuration(
+        main={"size": FRAME_SIZE, "format": "RGB888"},
+        transform=Transform(hflip=1, vflip=1),
+    )
+    picam2.configure(config)
+    picam2.start()
+    time.sleep(1.0)
+
+    W, H = FRAME_SIZE
+
+    # --- Window setup ---
+    WINDOW_NAME = "F.O.R.G.E. Demo 3"
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+    SCREEN_W, SCREEN_H = 1920, 1080
+    screen_size_locked = False
+    # FIX 4: track whether we've already logged the detection failure so we
+    # only print once instead of flooding the console every frame.
+    screen_size_warn_printed = False
+
+    center_pan, center_tilt = map_xy_to_pan_tilt(W / 2.0, H / 2.0, W, H, u_list, v_list, pv)
+    current_pan = clamp(center_pan, PAN_MIN, PAN_MAX)
+    current_tilt = clamp(center_tilt, TILT_MIN, TILT_MAX)
+
+    set_servo_angle(pwm_pan, current_pan)
+    set_servo_angle(pwm_tilt, current_tilt)
+
+    print("Started. AUTO by default. TAB select, ENTER lock, A auto, S search, ESC quit.")
+
+    # --- Start voice thread ---
+    if VOICE_ENABLED:
+        try:
+            voice_thread = threading.Thread(target=voice_listener_worker, daemon=True)
+            voice_thread.start()
+            print("[VOICE] Voice control enabled")
+        except Exception as e:
+            print(f"[VOICE] Could not start voice thread: {e}")
+
+    # ----------------------------
+    # STATE
+    # ----------------------------
+    ema_x = None
+    ema_y = None
+    last_det_time = 0.0
+    last_servo_update = 0.0
+
+    mode = "AUTO"
+    selected_idx = 0
+    locked_name = None
+    locked_cls_id = None
+    last_locked_seen_time = 0.0
+
+    auto_target_cls_id = None
+    auto_target_last_seen = 0.0
+    auto_target_last_switch = 0.0
+    auto_target_conf = 0.0
+
+    toast_msg = ""
+    toast_level = "info"
+    toast_until = 0.0
+
+    # Voice state
+    awake = False
+    awake_timeout = 0.0
+
+    def toast(msg, level="info", seconds=1.2):
+        global toast_msg, toast_level, toast_until
+        toast_msg = msg
+        toast_level = level
+        toast_until = time.time() + seconds
+
+    # FIX 7: initialize last_time slightly in the past so the first dt is
+    # at least 0.01 s, preventing a spurious huge FPS spike on frame 1.
+    last_time = time.time() - 0.1
+    fps = 0.0
+
+    tool_state = {
+        nm: {
+            "present": False,
+            "conf": 0.0,
+            "last_seen": 0.0,
+            "zone": None,
+            "state": "OFF_BENCH",
+            "prev_state": "OFF_BENCH",
+        }
+        for nm in FIXED_TOOL_ORDER
+    }
+
+    prev_drawer_open = None
+    prev_cabinet_open = None
+
+    search_active = False
+    search_text = ""
+
+    # ----------------------------
+    # MAIN LOOP
+    # ----------------------------
     while True:
         frame = picam2.capture_array()
         now = time.time()
 
         dt = now - last_time
-        if dt > 0:
+        # FIX 7: ignore implausibly small dt values (> 100 FPS) on the
+        # first frame or after any clock anomaly.
+        if dt > 0.01:
             inst = 1.0 / dt
             fps = inst if fps <= 0 else (0.85 * fps + 0.15 * inst)
         last_time = now
 
+        # Voice wake timeout
+        if awake and now > awake_timeout:
+            awake = False
+            toast("F.O.R.G.E. went back to sleep", "info", 1.0)
+
+        # Voice command parsing
         while not voice_command_queue.empty():
             spoken = voice_command_queue.get().strip()
-            cmd, arg = parse_voice_command(spoken)
+            cmd, arg = parse_voice_command(spoken, awake)
 
-            print(f"[VOICE] Heard: {spoken}")
+            if cmd != "none":
+                print(f"[VOICE] Parsed: {cmd} | Arg: {arg} | Raw: {spoken}")
+
+            if cmd == "wake_only":
+                awake = True
+                awake_timeout = now + 6.0
+                toast("Listening...", "info", 2.0)
+                continue
+
+            if cmd == "none":
+                continue
+
+            # A real command was processed — go back to sleep.
+            awake = False
 
             if cmd == "lock_tool":
                 cls_id = name_to_id.get(arg)
@@ -962,9 +964,6 @@ try:
                 c = "open" if prev_cabinet_open else "closed"
                 toast(f"Drawer {d}, cabinet {c}", "info", 1.3)
 
-            elif cmd == "wake_only":
-                toast("Yes?", "info", 1.2)
-
             elif cmd == "quit":
                 toast("FORGE: quitting", "warn", 0.8)
                 raise KeyboardInterrupt
@@ -972,6 +971,7 @@ try:
             elif cmd == "unknown_after_wake":
                 toast(f"Unknown command: {arg}", "warn", 1.0)
 
+        # Hardware sensing
         drawer_level = drawer_in.read()
         cabinet_level = cabinet_in.read()
 
@@ -991,7 +991,9 @@ try:
             toast("Cabinet opened" if cabinet_open else "Cabinet closed", "info", 1.1)
             prev_cabinet_open = cabinet_open
 
-        results = model(frame, imgsz=INFER_SIZE, conf=0.25, verbose=False)
+        # FIX 8: pass YOLO_CONF_FLOOR so the model only returns boxes we
+        # actually care about, removing the redundant double-filter.
+        results = model(frame, imgsz=INFER_SIZE, conf=YOLO_CONF_FLOOR, verbose=False)
         r = results[0]
 
         best_by_cls = {}
@@ -1111,6 +1113,11 @@ try:
                 if lost_for > LOCK_LOST_TIMEOUT:
                     GPIO.output(PIN_LASER, GPIO.LOW)
                     laser_state = False
+                    # FIX 6: kill PWM signal when the locked tool is lost so
+                    # the servos don't chatter on residual duty cycle.
+                    if ema_x is not None:
+                        pwm_pan.ChangeDutyCycle(0)
+                        pwm_tilt.ChangeDutyCycle(0)
                     ema_x = None
                     ema_y = None
                 else:
@@ -1124,6 +1131,10 @@ try:
                 if (now - last_det_time) > NO_DET_TIMEOUT:
                     GPIO.output(PIN_LASER, GPIO.LOW)
                     laser_state = False
+                    # FIX 6: same PWM cutoff for AUTO mode timeout.
+                    if ema_x is not None:
+                        pwm_pan.ChangeDutyCycle(0)
+                        pwm_tilt.ChangeDutyCycle(0)
                     ema_x = None
                     ema_y = None
                 else:
@@ -1167,8 +1178,12 @@ try:
                 if rw > 200 and rh > 200:
                     SCREEN_W, SCREEN_H = rw, rh
                     screen_size_locked = True
-            except Exception:
-                pass
+            except Exception as e:
+                # FIX 4: log once so we know detection is failing rather than
+                # silently running at the hardcoded 1920x1080 fallback forever.
+                if not screen_size_warn_printed:
+                    print(f"[WARN] getWindowImageRect failed (will use {SCREEN_W}x{SCREEN_H}): {e}")
+                    screen_size_warn_printed = True
 
         display = resize_to_fill(annotated, SCREEN_W, SCREEN_H)
 
@@ -1220,6 +1235,10 @@ try:
             else:
                 break
 
+        # NOTE (FIX 10): all key events below are consumed by a final `continue`
+        # at the end of the search_active block.  Any new keyboard shortcuts
+        # MUST be added outside (below) that block, not inside it, or they will
+        # be silently unreachable while search is active.
         if search_active:
             if key in (10, 13):
                 q = normalize_name(search_text)
@@ -1263,6 +1282,8 @@ try:
                         search_text += ch
                 continue
 
+            # Any other key while search is active: absorb and loop.
+            # Add new global shortcuts BELOW this if-block, not inside it.
             continue
 
         if key == 9:
@@ -1309,25 +1330,42 @@ try:
                     toast(f"LOCK: {locked_name}", "info", 1.0)
 
 finally:
-    GPIO.output(PIN_LASER, GPIO.LOW)
-
+    # Laser off first — always the top priority.
     try:
-        voice_audio_queue.put(None)
+        GPIO.output(PIN_LASER, GPIO.LOW)
     except Exception:
         pass
 
+    # FIX 2: signal the voice thread to stop, then wait for it so the
+    # sounddevice RawInputStream context manager exits cleanly and ALSA
+    # is not left in a locked state.
     try:
-        pwm_pan.ChangeDutyCycle(0)
-        pwm_tilt.ChangeDutyCycle(0)
-        pwm_pan.stop()
-        pwm_tilt.stop()
+        voice_audio_queue.put_nowait(None)
     except Exception:
         pass
+    if voice_thread is not None and voice_thread.is_alive():
+        voice_thread.join(timeout=2.0)
+
+    # Stop servos — zero duty cycle before stopping PWM to prevent a
+    # rogue pulse on the next boot.
+    if pwm_pan is not None:
+        try:
+            pwm_pan.ChangeDutyCycle(0)
+            pwm_pan.stop()
+        except Exception:
+            pass
+    if pwm_tilt is not None:
+        try:
+            pwm_tilt.ChangeDutyCycle(0)
+            pwm_tilt.stop()
+        except Exception:
+            pass
 
     GPIO.cleanup()
     cv2.destroyAllWindows()
 
-    try:
-        picam2.stop()
-    except Exception:
-        pass
+    if picam2 is not None:
+        try:
+            picam2.stop()
+        except Exception:
+            pass
